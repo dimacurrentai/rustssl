@@ -129,16 +129,20 @@ fn encrypt_file(input_path: &Path, output_path: &Path, password: Option<&str>) -
   };
   let raw = encrypt_openssl(&password_bytes, &plaintext);
   let encoded = BASE64.encode(&raw);
-  let mut content = encoded;
-  content.push('\n'); // OpenSSL's -a decoder expects a trailing newline
+  // 64-char lines so OpenSSL's -a decoder accepts arbitrarily large output
+  let wrapped: String =
+    encoded.as_bytes().chunks(64).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join("\n");
+  let mut content = wrapped;
+  content.push('\n');
   fs::write(output_path, content).map_err(|e| e.to_string())?;
   Ok(())
 }
 
 fn decrypt_file(input_path: &Path, output_path: &Path, password: Option<&str>) -> Result<(), String> {
   let encoded = fs::read_to_string(input_path).map_err(|e| e.to_string())?;
-  let encoded = encoded.trim_end(); // no trailing newline in our format
-  let raw = BASE64.decode(encoded).map_err(|e| e.to_string())?;
+  // Accept both one-line and OpenSSL's 64-char wrapped base64
+  let encoded: String = encoded.trim_end().chars().filter(|c| !c.is_whitespace()).collect();
+  let raw = BASE64.decode(&encoded).map_err(|e| e.to_string())?;
   let password_bytes = match password {
     Some(p) => p.as_bytes().to_vec(),
     None => read_password_tty("Enter decryption password: ").map_err(|e| e.to_string())?,
