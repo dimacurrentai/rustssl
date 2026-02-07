@@ -77,6 +77,19 @@ with open('$TMP/large.txt', 'w') as f:
     f.write(s)
 " 2>/dev/null || (printf '%4096s' '' | tr ' ' 'x' > "$TMP/large.txt")
 
+# Large payloads: 1 MiB and 10 MiB (pattern-filled for speed)
+create_large() {
+  local path="$1"
+  local size_mb="$2"
+  python3 -c "
+with open('$path', 'wb') as f:
+    f.write((b'x' * 4096) * (256 * $size_mb))
+" 2>/dev/null && return 0
+  dd if=/dev/zero bs=1048576 count="$size_mb" 2>/dev/null | tr '\0' 'x' > "$path" 2>/dev/null
+}
+create_large "$TMP/large1m.bin" 1
+create_large "$TMP/large10m.bin" 10
+
 # Binary (nulls and high bytes)
 printf '\\0\\1\\2\\xff\\xfe\\xfd\\0\\0\\0' > "$TMP/binary.bin"
 
@@ -86,10 +99,10 @@ touch "$TMP/empty.txt"
 # One block exactly (16 bytes)
 printf '0123456789abcdef' > "$TMP/oneblock.txt"
 
-FILES=("$TMP/small.txt" "$TMP/medium.txt" "$TMP/large.txt" "$TMP/binary.bin" "$TMP/empty.txt" "$TMP/oneblock.txt")
-LABELS=("small" "medium" "large" "binary" "empty" "oneblock")
+FILES=("$TMP/small.txt" "$TMP/medium.txt" "$TMP/large.txt" "$TMP/binary.bin" "$TMP/empty.txt" "$TMP/oneblock.txt" "$TMP/large1m.bin" "$TMP/large10m.bin")
+LABELS=("small" "medium" "large" "binary" "empty" "oneblock" "large1m" "large10m")
 
-echo "Test files: small, medium, large, binary, empty, oneblock"
+echo "Test files: small, medium, large, binary, empty, oneblock, large1m (1 MiB), large10m (10 MiB)"
 echo ""
 
 # --- Encryptors and decryptors ---
