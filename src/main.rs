@@ -89,10 +89,23 @@ fn derive_key_iv(password: &[u8], salt: &[u8; SALT_LEN]) -> ([u8; KEY_LEN], [u8;
   (key, iv)
 }
 
+trait SaltGen {
+  fn salt(&mut self) -> [u8; SALT_LEN];
+}
+
+struct StdRng;
+
+impl SaltGen for StdRng {
+  fn salt(&mut self) -> [u8; SALT_LEN] {
+    let mut buf = [0u8; SALT_LEN];
+    rand::thread_rng().fill_bytes(&mut buf);
+    buf
+  }
+}
+
 /// Encrypt to OpenSSL-compatible format (binary: Salted__ + salt + ciphertext).
-fn encrypt_openssl(password: &[u8], plaintext: &[u8]) -> Vec<u8> {
-  let mut salt = [0u8; SALT_LEN];
-  rand::thread_rng().fill_bytes(&mut salt);
+fn encrypt_openssl(password: &[u8], plaintext: &[u8], rng: &mut impl SaltGen) -> Vec<u8> {
+  let salt = rng.salt();
   let (key, iv) = derive_key_iv(password, &salt);
   let padded = pkcs7_pad(plaintext);
   let ciphertext = cbc_encrypt(&padded, &key, &iv);
@@ -127,7 +140,7 @@ fn encrypt_file(input_path: &Path, output_path: &Path, password: Option<&str>) -
     Some(p) => p.as_bytes().to_vec(),
     None => read_password_tty("Enter encryption password: ").map_err(|e| e.to_string())?,
   };
-  let raw = encrypt_openssl(&password_bytes, &plaintext);
+  let raw = encrypt_openssl(&password_bytes, &plaintext, &mut StdRng);
   let encoded = BASE64.encode(&raw);
   // 64-char lines so OpenSSL's -a decoder accepts arbitrarily large output
   let wrapped: String =

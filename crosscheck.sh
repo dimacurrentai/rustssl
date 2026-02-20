@@ -1,6 +1,6 @@
 #!/bin/bash
-# Cross-check all encrypt/decrypt combinations (OpenSSL vs Rust).
-# Tests: enc.sh, dec.sh, renc.sh, rdec.sh with multiple inputs.
+# Cross-check all encrypt/decrypt combinations (OpenSSL vs Rust vs WASM).
+# Tests: enc.sh, dec.sh, renc.sh, rdec.sh, wenc.sh, wdec.sh with multiple inputs.
 # Usage: ./crosscheck.sh [password]
 # Default password: crosscheck (override with first arg).
 
@@ -19,6 +19,11 @@ if [ ! -x "target/debug/rustsslcmd" ] && [ ! -x "target/release/rustsslcmd" ]; t
   echo "Error: Rust binary not found. Run: cargo build" >&2
   exit 1
 fi
+
+# Build WASM
+echo "Building WASM..."
+./wbuild.sh
+echo ""
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -52,7 +57,7 @@ run_test() {
 }
 
 echo "=============================================="
-echo " OpenSSL / Rust encrypt-decrypt cross-check"
+echo " OpenSSL / Rust / WASM encrypt-decrypt cross-check"
 echo "=============================================="
 echo "Password: (set via first argument; default: crosscheck)"
 echo "Temp dir: $TMP"
@@ -110,16 +115,18 @@ ENC_OPENSSL="./enc.sh"
 DEC_OPENSSL="./dec.sh"
 ENC_RUST="./renc.sh"
 DEC_RUST="./rdec.sh"
+ENC_WASM="./wenc.sh"
+DEC_WASM="./wdec.sh"
 
 # --- Matrix: each encryptor x each decryptor x representative files ---
 echo "----------------------------------------------"
 echo " Matrix: encrypt with X, decrypt with Y"
 echo "----------------------------------------------"
 
-for ei in "OPENSSL:$ENC_OPENSSL" "RUST:$ENC_RUST"; do
+for ei in "OPENSSL:$ENC_OPENSSL" "RUST:$ENC_RUST" "WASM:$ENC_WASM"; do
   enc_name="${ei%%:*}"
   enc_cmd="${ei#*:}"
-  for di in "OPENSSL:$DEC_OPENSSL" "RUST:$DEC_RUST"; do
+  for di in "OPENSSL:$DEC_OPENSSL" "RUST:$DEC_RUST" "WASM:$DEC_WASM"; do
     dec_name="${di%%:*}"
     dec_cmd="${di#*:}"
     echo ""
