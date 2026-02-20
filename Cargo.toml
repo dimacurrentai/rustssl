@@ -5,10 +5,3 @@ edition = "2021"
 description = "OpenSSL-compatible AES-256-CBC encrypt/decrypt (Salted__, PBKDF2)"
 
 [dependencies]
-aes = "0.8"
-cipher = "0.4"
-pbkdf2 = "0.12"
-sha2 = "0.10"
-base64 = "0.21"
-rand = "0.8"
-rpassword = "7"

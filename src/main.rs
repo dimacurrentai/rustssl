@@ -1,15 +1,16 @@
-//! OpenSSL-compatible AES-256-CBC encrypt/decrypt.
+//! OpenSSL-compatible AES-256-CBC encrypt/decrypt — zero external dependencies.
 //! Format: "Salted__" (8 bytes) + salt (8 bytes) + ciphertext; whole thing base64 when -a.
 //! Key derivation: PBKDF2-HMAC-SHA256, 10000 iterations, 48 bytes (key 32 + iv 16).
 
-use aes::Aes256;
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use cipher::{Block, BlockDecryptMut, BlockEncryptMut, KeyInit};
-use pbkdf2::pbkdf2_hmac;
-use rand::RngCore;
-use sha2::Sha256;
+mod aes256;
+mod readpass;
+mod sha256;
+
+use aes256::Aes256;
+use sha256::pbkdf2_hmac_sha256;
+use std::collections::hash_map::RandomState;
 use std::fs;
-use std::io;
+use std::hash::{BuildHasher, Hasher};
 use std::path::Path;
 
 const MAGIC: &[u8; 8] = b"Salted__";
@@ -19,11 +20,72 @@ const KEY_LEN: usize = 32;
 const IV_LEN: usize = 16;
 const BLOCK: usize = 16;
 
+// --- Base64 ---
+
+const B64_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn b64_encode(data: &[u8]) -> String {
+  let mut out = Vec::with_capacity((data.len() + 2) / 3 * 4);
+  for chunk in data.chunks(3) {
+    let (b0, b1, b2) = (
+      chunk[0] as u32,
+      if chunk.len() > 1 { chunk[1] as u32 } else { 0 },
+      if chunk.len() > 2 { chunk[2] as u32 } else { 0 },
+    );
+    let n = (b0 << 16) | (b1 << 8) | b2;
+    out.push(B64_CHARS[((n >> 18) & 63) as usize]);
+    out.push(B64_CHARS[((n >> 12) & 63) as usize]);
+    if chunk.len() > 1 {
+      out.push(B64_CHARS[((n >> 6) & 63) as usize]);
+    } else {
+      out.push(b'=');
+    }
+    if chunk.len() > 2 {
+      out.push(B64_CHARS[(n & 63) as usize]);
+    } else {
+      out.push(b'=');
+    }
+  }
+  String::from_utf8(out).unwrap()
+}
+
+fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
+  let s: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+  if s.len() % 4 != 0 {
+    return Err("invalid base64 length".into());
+  }
+  let mut out = Vec::with_capacity(s.len() / 4 * 3);
+  for chunk in s.chunks(4) {
+    let mut vals = [0u32; 4];
+    for (i, &ch) in chunk.iter().enumerate() {
+      vals[i] = match ch {
+        b'A'..=b'Z' => (ch - b'A') as u32,
+        b'a'..=b'z' => (ch - b'a' + 26) as u32,
+        b'0'..=b'9' => (ch - b'0' + 52) as u32,
+        b'+' => 62,
+        b'/' => 63,
+        b'=' => 0,
+        _ => return Err(format!("invalid base64 char: {}", ch as char)),
+      };
+    }
+    let n = (vals[0] << 18) | (vals[1] << 12) | (vals[2] << 6) | vals[3];
+    out.push((n >> 16) as u8);
+    if chunk[2] != b'=' {
+      out.push((n >> 8) as u8);
+    }
+    if chunk[3] != b'=' {
+      out.push(n as u8);
+    }
+  }
+  Ok(out)
+}
+
+// --- PKCS7 ---
+
 fn pkcs7_pad(data: &[u8]) -> Vec<u8> {
   let n = BLOCK - (data.len() % BLOCK);
-  let pad_byte = n as u8;
   let mut out = data.to_vec();
-  out.resize(data.len() + n, pad_byte);
+  out.resize(data.len() + n, n as u8);
   out
 }
 
@@ -31,57 +93,61 @@ fn pkcs7_unpad(data: &[u8]) -> Result<Vec<u8>, String> {
   if data.is_empty() || data.len() % BLOCK != 0 {
     return Err("invalid length".into());
   }
-  let pad_byte = *data.last().unwrap();
-  if pad_byte == 0 || pad_byte as usize > BLOCK {
+  let pad = *data.last().unwrap();
+  if pad == 0 || pad as usize > BLOCK {
     return Err("invalid padding".into());
   }
-  let len = data.len().saturating_sub(pad_byte as usize);
-  for i in (len..data.len()).rev() {
-    if data[i] != pad_byte {
+  let len = data.len() - pad as usize;
+  for &b in &data[len..] {
+    if b != pad {
       return Err("invalid padding".into());
     }
   }
   Ok(data[..len].to_vec())
 }
 
+// --- CBC ---
+
 fn cbc_encrypt(plain: &[u8], key: &[u8; KEY_LEN], iv: &[u8; IV_LEN]) -> Vec<u8> {
-  let mut cipher = Aes256::new_from_slice(key).unwrap();
+  let cipher = Aes256::new(key);
   let mut out = Vec::with_capacity(plain.len());
   let mut prev = *iv;
   for chunk in plain.chunks(BLOCK) {
-    let mut block = Block::<Aes256>::default();
+    let mut block = [0u8; BLOCK];
     block.copy_from_slice(chunk);
-    for (a, &b) in block.iter_mut().zip(prev.iter()) {
-      *a ^= b;
+    for i in 0..BLOCK {
+      block[i] ^= prev[i];
     }
-    cipher.encrypt_block_mut(&mut block);
+    cipher.encrypt_block(&mut block);
     out.extend_from_slice(&block);
-    prev = block.into();
+    prev = block;
   }
   out
 }
 
 fn cbc_decrypt(ciphertext: &[u8], key: &[u8; KEY_LEN], iv: &[u8; IV_LEN]) -> Vec<u8> {
-  let mut cipher = Aes256::new_from_slice(key).unwrap();
+  let cipher = Aes256::new(key);
   let mut out = Vec::with_capacity(ciphertext.len());
   let mut prev = *iv;
   for chunk in ciphertext.chunks(BLOCK) {
-    let mut block = Block::<Aes256>::default();
+    let mut block = [0u8; BLOCK];
     block.copy_from_slice(chunk);
-    let block_copy: [u8; BLOCK] = block.into();
-    cipher.decrypt_block_mut(&mut block);
-    for (a, &b) in block.iter_mut().zip(prev.iter()) {
-      *a ^= b;
+    let saved = block;
+    cipher.decrypt_block(&mut block);
+    for i in 0..BLOCK {
+      block[i] ^= prev[i];
     }
     out.extend_from_slice(&block);
-    prev = block_copy;
+    prev = saved;
   }
   out
 }
 
+// --- Key derivation ---
+
 fn derive_key_iv(password: &[u8], salt: &[u8; SALT_LEN]) -> ([u8; KEY_LEN], [u8; IV_LEN]) {
   let mut buf = [0u8; KEY_LEN + IV_LEN];
-  pbkdf2_hmac::<Sha256>(password, salt, PBKDF2_ITER, &mut buf);
+  pbkdf2_hmac_sha256(password, salt, PBKDF2_ITER, &mut buf);
   let mut key = [0u8; KEY_LEN];
   let mut iv = [0u8; IV_LEN];
   key.copy_from_slice(&buf[..KEY_LEN]);
@@ -89,79 +155,70 @@ fn derive_key_iv(password: &[u8], salt: &[u8; SALT_LEN]) -> ([u8; KEY_LEN], [u8;
   (key, iv)
 }
 
-trait SaltGen {
-  fn salt(&mut self) -> [u8; SALT_LEN];
+// --- Salt generation ---
+
+fn random_salt() -> [u8; SALT_LEN] {
+  RandomState::new().build_hasher().finish().to_le_bytes()
 }
 
-struct StdRng;
+// --- OpenSSL-format encrypt/decrypt ---
 
-impl SaltGen for StdRng {
-  fn salt(&mut self) -> [u8; SALT_LEN] {
-    let mut buf = [0u8; SALT_LEN];
-    rand::thread_rng().fill_bytes(&mut buf);
-    buf
-  }
-}
-
-/// Encrypt to OpenSSL-compatible format (binary: Salted__ + salt + ciphertext).
-fn encrypt_openssl(password: &[u8], plaintext: &[u8], rng: &mut impl SaltGen) -> Vec<u8> {
-  let salt = rng.salt();
+fn encrypt_openssl(password: &[u8], plaintext: &[u8]) -> String {
+  let salt = random_salt();
   let (key, iv) = derive_key_iv(password, &salt);
   let padded = pkcs7_pad(plaintext);
-  let ciphertext = cbc_encrypt(&padded, &key, &iv);
-  let mut out = Vec::with_capacity(MAGIC.len() + SALT_LEN + ciphertext.len());
-  out.extend_from_slice(MAGIC);
-  out.extend_from_slice(&salt);
-  out.extend_from_slice(&ciphertext);
-  out
+  let ct = cbc_encrypt(&padded, &key, &iv);
+  let mut raw = Vec::with_capacity(MAGIC.len() + SALT_LEN + ct.len());
+  raw.extend_from_slice(MAGIC);
+  raw.extend_from_slice(&salt);
+  raw.extend_from_slice(&ct);
+  let encoded = b64_encode(&raw);
+  // 64-char line wrapping for OpenSSL compatibility
+  let mut wrapped = String::with_capacity(encoded.len() + encoded.len() / 64 + 1);
+  for (i, ch) in encoded.chars().enumerate() {
+    if i > 0 && i % 64 == 0 {
+      wrapped.push('\n');
+    }
+    wrapped.push(ch);
+  }
+  wrapped.push('\n');
+  wrapped
 }
 
-/// Decrypt from OpenSSL-compatible format (binary).
-fn decrypt_openssl(password: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
-  if data.len() < MAGIC.len() + SALT_LEN || &data[..MAGIC.len()] != MAGIC {
+fn decrypt_openssl(password: &[u8], data: &str) -> Result<Vec<u8>, String> {
+  let raw = b64_decode(data)?;
+  if raw.len() < MAGIC.len() + SALT_LEN || &raw[..MAGIC.len()] != MAGIC {
     return Err("invalid format: missing or wrong Salted__ header".into());
   }
   let mut salt = [0u8; SALT_LEN];
-  salt.copy_from_slice(&data[MAGIC.len()..MAGIC.len() + SALT_LEN]);
-  let ciphertext = &data[MAGIC.len() + SALT_LEN..];
+  salt.copy_from_slice(&raw[MAGIC.len()..MAGIC.len() + SALT_LEN]);
+  let ct = &raw[MAGIC.len() + SALT_LEN..];
   let (key, iv) = derive_key_iv(password, &salt);
-  let padded = cbc_decrypt(ciphertext, &key, &iv);
+  let padded = cbc_decrypt(ct, &key, &iv);
   pkcs7_unpad(&padded)
 }
 
-fn read_password_tty(prompt: &str) -> io::Result<Vec<u8>> {
-  let pass = rpassword::prompt_password(prompt)?;
-  Ok(pass.into_bytes())
-}
+// --- File I/O ---
 
-fn encrypt_file(input_path: &Path, output_path: &Path, password: Option<&str>) -> Result<(), String> {
-  let plaintext = fs::read(input_path).map_err(|e| e.to_string())?;
+fn encrypt_file(input: &Path, output: &Path, password: Option<&str>) -> Result<(), String> {
+  let plaintext = fs::read(input).map_err(|e| e.to_string())?;
   let password_bytes = match password {
     Some(p) => p.as_bytes().to_vec(),
-    None => read_password_tty("Enter encryption password: ").map_err(|e| e.to_string())?,
+    None => readpass::read_password("Enter encryption password: ").map_err(|e| e.to_string())?,
   };
-  let raw = encrypt_openssl(&password_bytes, &plaintext, &mut StdRng);
-  let encoded = BASE64.encode(&raw);
-  // 64-char lines so OpenSSL's -a decoder accepts arbitrarily large output
-  let wrapped: String =
-    encoded.as_bytes().chunks(64).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join("\n");
-  let mut content = wrapped;
-  content.push('\n');
-  fs::write(output_path, content).map_err(|e| e.to_string())?;
+  let content = encrypt_openssl(&password_bytes, &plaintext);
+  fs::write(output, content).map_err(|e| e.to_string())?;
   Ok(())
 }
 
-fn decrypt_file(input_path: &Path, output_path: &Path, password: Option<&str>) -> Result<(), String> {
-  let encoded = fs::read_to_string(input_path).map_err(|e| e.to_string())?;
-  // Accept both one-line and OpenSSL's 64-char wrapped base64
-  let encoded: String = encoded.trim_end().chars().filter(|c| !c.is_whitespace()).collect();
-  let raw = BASE64.decode(&encoded).map_err(|e| e.to_string())?;
+fn decrypt_file(input: &Path, output: &Path, password: Option<&str>) -> Result<(), String> {
+  let encoded = fs::read_to_string(input).map_err(|e| e.to_string())?;
   let password_bytes = match password {
     Some(p) => p.as_bytes().to_vec(),
-    None => read_password_tty("Enter decryption password: ").map_err(|e| e.to_string())?,
+    None => readpass::read_password("Enter decryption password: ").map_err(|e| e.to_string())?,
   };
-  let plaintext = decrypt_openssl(&password_bytes, &raw)?;
-  fs::write(output_path, &plaintext).map_err(|e| e.to_string())?;
+  let plaintext = decrypt_openssl(&password_bytes, &encoded)?;
+  fs::write(output, &plaintext).map_err(|e| e.to_string())?;
   Ok(())
 }
 

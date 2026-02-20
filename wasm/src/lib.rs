@@ -2,7 +2,9 @@
 //! All crypto (AES, SHA-256, HMAC, PBKDF2, Base64) implemented from scratch.
 //! Format: "Salted__" + salt(8) + ciphertext, base64-encoded with 64-char lines.
 
+#[path = "../../src/aes256.rs"]
 mod aes256;
+#[path = "../../src/sha256.rs"]
 mod sha256;
 
 use aes256::Aes256;
